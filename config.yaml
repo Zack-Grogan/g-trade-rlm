@@ -1,0 +1,16 @@
+# RLM service config. Advisory-only: reports and recommendations, no execution changes.
+x_ai:
+  model: "grok-beta"
+  api_key_env: "X_AI_API_KEY"
+
+upstash:
+  redis_url_env: "UPSTASH_REDIS_URL"
+  qstash_url_env: "UPSTASH_QSTASH_URL"
+  workflow_url_env: "UPSTASH_WORKFLOW_URL"
+  vector_url_env: "UPSTASH_VECTOR_URL"
+
+rlm:
+  hypothesis_generation_interval: 3600  # seconds
+  min_confidence_threshold: 0.7
+  max_generations: 50
+  bh_fdr_alpha: 0.10
