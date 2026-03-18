@@ -49,6 +49,31 @@ app = FastAPI(
 )
 
 
+def _ensure_schema() -> None:
+    """Apply RLM schema (knowledge_store, trade_embeddings, replay_runs) if tables don't exist."""
+    import psycopg2
+    DATABASE_URL = os.environ.get("DATABASE_URL", "")
+    if not DATABASE_URL:
+        return
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    if not os.path.exists(schema_path):
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with open(schema_path) as f:
+            conn.cursor().execute(f.read())
+        conn.commit()
+        conn.close()
+        logger.info("RLM schema applied")
+    except Exception as e:
+        logger.warning("Could not apply RLM schema: %s", e)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    _ensure_schema()
+
+
 @app.exception_handler(RuntimeError)
 def runtime_error_handler(request, exc: RuntimeError):
     """Return 503 when DATABASE_URL (or other required config) is missing instead of 500."""
