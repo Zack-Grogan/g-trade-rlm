@@ -1,5 +1,5 @@
 """
-Hypothesis generation as a LangGraph DAG: observation → hypothesis (Grok) → parse.
+Hypothesis generation as a LangGraph DAG: observation → hypothesis → parse.
 Persisted checkpoints, run_id via thread_id, step-level telemetry. Advisory-only.
 """
 from __future__ import annotations
@@ -9,10 +9,10 @@ import uuid
 from typing import Any
 from typing_extensions import TypedDict
 
-from langchain_xai import ChatXAI
 from langgraph.graph import START, END, StateGraph
 from langgraph.checkpoint.memory import InMemorySaver
 
+from ai_provider import get_chat_model
 from meta_learner import get_meta_stats
 
 
@@ -28,9 +28,9 @@ class HypothesisState(TypedDict, total=False):
     hypotheses: list[dict[str, Any]]
 
 
-def _get_grok():
-    """Lazy ChatXAI for Grok (grok-beta)."""
-    return ChatXAI(model="grok-beta", temperature=0)
+def _get_model():
+    """Lazy LangChain chat model for hypothesis generation."""
+    return get_chat_model()
 
 
 def gather_observation(state: HypothesisState) -> dict[str, Any]:
@@ -46,8 +46,8 @@ def gather_observation(state: HypothesisState) -> dict[str, Any]:
 
 
 def generate_claims(state: HypothesisState) -> dict[str, Any]:
-    """Node: call Grok to generate testable hypothesis claims (raw text)."""
-    llm = _get_grok()
+    """Node: call the configured chat model to generate testable claims."""
+    llm = _get_model()
     system = (
         "You are a quantitative research assistant. Produce testable, falsifiable market hypotheses "
         "based on the given regime context and prior conclusions. Output concise hypothesis claims "

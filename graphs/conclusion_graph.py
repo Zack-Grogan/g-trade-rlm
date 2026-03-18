@@ -1,5 +1,5 @@
 """
-Conclusion engine as a LangGraph DAG: analysis → interpret (Grok) → parse verdict.
+Conclusion engine as a LangGraph DAG: analysis → interpret → parse verdict.
 Persisted checkpoints, run_id via thread_id. Advisory-only; no execution changes.
 """
 from __future__ import annotations
@@ -7,9 +7,10 @@ from __future__ import annotations
 from typing import Any
 from typing_extensions import TypedDict
 
-from langchain_xai import ChatXAI
 from langgraph.graph import START, END, StateGraph
 from langgraph.checkpoint.memory import InMemorySaver
+
+from ai_provider import get_chat_model
 
 
 class ConclusionState(TypedDict, total=False):
@@ -23,14 +24,14 @@ class ConclusionState(TypedDict, total=False):
     mutation_directive: str | None
 
 
-def _get_grok():
-    """Lazy ChatXAI for Grok."""
-    return ChatXAI(model="grok-beta", temperature=0)
+def _get_model():
+    """Lazy LangChain chat model for conclusion generation."""
+    return get_chat_model()
 
 
 def interpret_analysis(state: ConclusionState) -> dict[str, Any]:
-    """Node: Grok interprets experiment analysis and produces verdict + directive."""
-    llm = _get_grok()
+    """Node: interpret experiment analysis and produce verdict + directive."""
+    llm = _get_model()
     analysis = state.get("analysis") or {}
     system = (
         "You are a quantitative research reviewer. Given experiment analysis (Sharpe, win rate, p-value, etc.), "

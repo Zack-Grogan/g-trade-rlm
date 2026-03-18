@@ -9,5 +9,6 @@ upstash-vector>=0.1.0
 # upstash-workflow requires qstash<3; omit and use QStash HTTP only for replay
 langgraph>=0.2.0
 langchain-core>=0.3.0
+langchain-openrouter>=0.1.0
 langchain-xai>=0.1.0
 daytona-sdk>=0.1.0

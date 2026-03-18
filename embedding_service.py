@@ -1,9 +1,10 @@
 """
-Trade embedding generation (Grok) and semantic search (Upstash Vector + Postgres trade_embeddings).
+Trade embedding generation and semantic search backed by Postgres trade_embeddings.
 Used for similar-trade queries, e.g. similar failed trades in a regime. Advisory-only.
 """
 from __future__ import annotations
 
+import math
 import logging
 from typing import Any
 
@@ -11,7 +12,6 @@ from psycopg2.extras import RealDictCursor
 
 from db import db_conn
 from grok_client import embed_text_for_similarity
-from upstash_client import vector_upsert, vector_query
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def _trade_to_text(trade: dict[str, Any]) -> str:
 
 
 async def embed_trade(trade: dict[str, Any], trade_id: int) -> list[float] | None:
-    """Generate embedding for a trade using Grok; store in Postgres and Upstash Vector."""
+    """Generate embedding for a trade using Grok; store it in Postgres."""
     text = _trade_to_text(trade)
     vec = await embed_text_for_similarity(text, dimension=EMBEDDING_DIMENSION)
     if not vec:
@@ -50,7 +50,6 @@ async def embed_trade(trade: dict[str, Any], trade_id: int) -> list[float] | Non
             conn.commit()
     except Exception as e:
         logger.warning("Failed to store trade_embeddings in Postgres: %s", e)
-    vector_upsert(str(trade_id), vec, metadata={"pnl": trade.get("pnl"), "zone": trade.get("zone"), "regime": trade.get("regime")})
     return vec
 
 
@@ -78,6 +77,31 @@ def get_embedding_from_postgres(trade_id: int) -> list[float] | None:
         return None
 
 
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return -1.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return -1.0
+    return dot / (left_norm * right_norm)
+
+
+def get_candidate_embeddings(exclude_trade_id: int) -> list[dict[str, Any]]:
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT te.trade_id, te.embedding, ct.pnl
+               FROM trade_embeddings te
+               JOIN completed_trades ct ON ct.id = te.trade_id
+               WHERE te.trade_id <> %s
+                 AND te.embedding IS NOT NULL""",
+            (exclude_trade_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 async def find_similar_trades(trade_id: int, limit: int = 10, pnl_negative_only: bool = False) -> list[dict[str, Any]]:
     """
     Find trades similar to the given trade_id. Uses embedding from Postgres or generates via Grok.
@@ -91,17 +115,21 @@ async def find_similar_trades(trade_id: int, limit: int = 10, pnl_negative_only:
         embedding = await embed_trade(trade, trade_id)
     if not embedding:
         return []
-    results = vector_query(embedding, top_k=limit + 20)
+    scored_candidates: list[tuple[int, float, float]] = []
+    for candidate in get_candidate_embeddings(trade_id):
+        tid = int(candidate["trade_id"])
+        candidate_embedding = list(candidate.get("embedding") or [])
+        score = _cosine_similarity(embedding, candidate_embedding)
+        if score < 0:
+            continue
+        candidate_pnl = float(candidate.get("pnl") or 0.0)
+        if pnl_negative_only and candidate_pnl >= 0:
+            continue
+        scored_candidates.append((tid, score, candidate_pnl))
+
+    scored_candidates.sort(key=lambda item: item[1], reverse=True)
     out = []
-    for vid, score, meta in results:
-        if vid == str(trade_id):
-            continue
-        try:
-            tid = int(vid)
-        except (ValueError, TypeError):
-            continue
-        if pnl_negative_only and meta is not None and (meta.get("pnl") or 0) >= 0:
-            continue
+    for tid, score, _candidate_pnl in scored_candidates[: limit + 20]:
         t = get_trade(tid)
         if t:
             t["_score"] = score
