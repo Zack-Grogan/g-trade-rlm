@@ -1,7 +1,10 @@
 # RLM service config. Advisory-only: reports and recommendations, no execution changes.
-x_ai:
-  model: "grok-beta"
-  api_key_env: "X_AI_API_KEY"
+ai:
+  provider: "openrouter"
+  model: "anthropic/claude-sonnet-4.5"
+  api_key_env: "OPENROUTER_API_KEY"
+  temperature: 0
+  max_retries: 2
 
 upstash:
   redis_url_env: "UPSTASH_REDIS_URL"

@@ -1,7 +1,7 @@
 """
 g-trade-rlm: Advisory-only RLM service.
 Produces reports, hypotheses, conclusions, and recommendations. Does NOT change execution config or strategy.
-Auth: Bearer RLM_AUTH_TOKEN (from env). /health and /config are open (same policy as other services).
+Auth: Bearer RLM_AUTH_TOKEN or GTRADE_INTERNAL_API_TOKEN. /health and /config are open.
 """
 from __future__ import annotations
 
@@ -12,12 +12,18 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Query, Body, status
 from fastapi.responses import JSONResponse
+from psycopg2.extras import Json, RealDictCursor
+
+from ai_provider import get_chat_model
+from db import db_conn
+from report_service import build_report_context, generate_report_bundle, get_report, list_reports
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 _config: dict | None = None
 
+INTERNAL_API_TOKEN = (os.environ.get("GTRADE_INTERNAL_API_TOKEN") or "").strip()
 RLM_AUTH_TOKEN = (os.environ.get("RLM_AUTH_TOKEN") or "").strip()
 
 
@@ -30,17 +36,57 @@ def load_config() -> dict:
 
 
 def _bearer_ok(authorization: str | None) -> bool:
-    if not RLM_AUTH_TOKEN:
-        # If no token is configured, fail closed rather than open.
-        return False
     if not authorization or not authorization.startswith("Bearer "):
         return False
-    return authorization[7:].strip() == RLM_AUTH_TOKEN
+    token = authorization[7:].strip()
+    allowed = [candidate for candidate in (RLM_AUTH_TOKEN, INTERNAL_API_TOKEN) if candidate]
+    return bool(allowed) and token in allowed
 
 
 def _require_auth(authorization: str | None) -> None:
     if not _bearer_ok(authorization):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing Bearer token")
+
+
+def _submit_conclusion_record(
+    *,
+    result_id: int,
+    verdict: str,
+    confidence_score: float | None = None,
+    mutation_directive: str | None = None,
+    regime_tags: dict | None = None,
+) -> dict | None:
+    if verdict not in {"supported", "rejected", "inconclusive"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid verdict")
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT hypothesis_id FROM experiment_results WHERE id = %s", (result_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        hypothesis_id = row["hypothesis_id"]
+        cur.execute(
+            """INSERT INTO knowledge_store (
+                   hypothesis_id, result_id, verdict, confidence_score, mutation_directive, regime_tags,
+                   survival_count, rejection_count, last_validated_at
+               )
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+               RETURNING id, hypothesis_id, result_id, verdict, confidence_score, mutation_directive, regime_tags,
+                         survival_count, rejection_count, created_at, last_validated_at""",
+            (
+                hypothesis_id,
+                result_id,
+                verdict,
+                confidence_score,
+                mutation_directive,
+                Json(regime_tags or {}),
+                1 if verdict == "supported" else 0,
+                1 if verdict == "rejected" else 0,
+            ),
+        )
+        record = dict(cur.fetchone() or {})
+        conn.commit()
+        return record or None
 
 
 app = FastAPI(
@@ -98,7 +144,7 @@ def config_summary():
     """Return non-secret config summary (env var names only, no values)."""
     c = load_config()
     return {
-        "x_ai": {"model": c.get("x_ai", {}).get("model"), "api_key_env": c.get("x_ai", {}).get("api_key_env")},
+        "ai": c.get("ai", {}),
         "rlm": c.get("rlm", {}),
     }
 
@@ -149,6 +195,122 @@ async def generate_hypothesis(
     if not hypotheses:
         return {"hypothesis": None, "hypotheses": []}
     return {"hypothesis": hypotheses[0], "hypotheses": hypotheses}
+
+
+@app.post("/reports/generate")
+async def generate_report(
+    body: dict = Body(default_factory=dict),
+    authorization: str | None = Header(None),
+):
+    """Generate and persist one on-demand AI report bundle."""
+    _require_auth(authorization)
+    body = body or {}
+    try:
+        return generate_report_bundle(
+            regime_context=body.get("regime_context", ""),
+            generation=body.get("generation", 1),
+            report_type=body.get("report_type", "on_demand"),
+            lookback=body.get("lookback", 8),
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "api key" in msg or "openrouter" in msg or "database_url" in msg or "not set" in msg:
+            return JSONResponse(status_code=503, content={"detail": str(e), "service_unavailable": True})
+        raise
+
+
+@app.get("/reports")
+async def reports(
+    limit: int = Query(20, ge=1, le=100),
+    authorization: str | None = Header(None),
+):
+    """List persisted AI report bundles."""
+    _require_auth(authorization)
+    return {"reports": list_reports(limit=limit)}
+
+
+@app.get("/reports/{report_id}")
+async def report_detail(
+    report_id: str,
+    authorization: str | None = Header(None),
+):
+    """Fetch a single AI report bundle."""
+    _require_auth(authorization)
+    report = get_report(report_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+    return report
+
+
+@app.post("/conclusions/submit")
+async def submit_conclusion(
+    body: dict = Body(default_factory=dict),
+    authorization: str | None = Header(None),
+):
+    """Persist an advisory conclusion to the knowledge store. RLM owns this write path."""
+    _require_auth(authorization)
+    result_id = body.get("result_id")
+    if result_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="result_id required")
+    record = _submit_conclusion_record(
+        result_id=int(result_id),
+        verdict=str(body.get("verdict") or ""),
+        confidence_score=body.get("confidence_score"),
+        mutation_directive=body.get("mutation_directive"),
+        regime_tags=body.get("regime_tags") if isinstance(body.get("regime_tags"), dict) else None,
+    )
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Experiment result not found")
+    return {"knowledge_entry": record}
+
+
+@app.post("/chat/analyze")
+async def chat_analyze(
+    body: dict = Body(default_factory=dict),
+    authorization: str | None = Header(None),
+):
+    """Operator-facing advisory chat endpoint for investigation and report drafting."""
+    _require_auth(authorization)
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="prompt required")
+    context = build_report_context(
+        lookback=int(body.get("lookback") or 8),
+        regime_context=str(body.get("regime_context") or "operator investigation"),
+        generation=int(body.get("generation") or 1),
+    )
+    llm = get_chat_model()
+    response = llm.invoke(
+        [
+            (
+                "system",
+                "You are the G-Trade operator analysis assistant. Stay advisory-only. "
+                "Use the supplied context to explain risks, anomalies, bridge/log issues, and research conclusions. "
+                "Do not suggest live trade execution changes as commands.",
+            ),
+            (
+                "user",
+                "\n\n".join(
+                    [
+                        f"Prompt: {prompt}",
+                        f"Regime context: {context['regime_context']}",
+                        f"Summary: {context['summary']}",
+                        f"Recent runs:\n{context['recent_runs_text']}",
+                        f"Recent trades:\n{context['recent_trades_text']}",
+                        f"Recent knowledge:\n{context['recent_knowledge_text']}",
+                    ]
+                ),
+            ),
+        ]
+    )
+    return {
+        "message": getattr(response, "content", str(response)),
+        "context": {
+            "summary": context["summary"],
+            "regime_context": context["regime_context"],
+            "generation": context["generation"],
+        },
+    }
 
 
 @app.get("/benchmark/checkpoints")
